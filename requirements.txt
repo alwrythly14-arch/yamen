@@ -1,0 +1,9 @@
+streamlit
+pandas
+psycopg2-binary
+requests
+python-dotenv
+streamlit-option-menu
+gspread
+gspread-dataframe
+google-auth
