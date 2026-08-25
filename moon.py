@@ -238,6 +238,21 @@ def initialize_database_schema(_conn):
     if existing_date_col_type and existing_date_col_type[0] != "text":
         c.execute("ALTER TABLE news ALTER COLUMN date TYPE TEXT")
 
+    # قيد فريد على رابط الخبر (url) لمنع تكرار نفس الخبر بقاعدة البيانات
+    # (مهم جداً لحل مشكلة "أخبار قديمة أو مكررة" القادمة من n8n): نضيف القيد
+    # فقط لو ما كان موجود مسبقاً، وبأمان تام لو فيه صفوف قديمة فيها روابط
+    # مكررة أو فاضية (NULL) — في هالحالة نتجاهل الإضافة بصمت بدل ما نطلع خطأ
+    # يوقف تشغيل التطبيق بالكامل (تكرار موجود مسبقاً يحتاج تنظيف يدوي أولاً).
+    c.execute("""
+        SELECT 1 FROM pg_constraint WHERE conname = 'news_url_unique'
+    """)
+    if c.fetchone() is None:
+        try:
+            c.execute("ALTER TABLE news ADD CONSTRAINT news_url_unique UNIQUE (url)")
+        except psycopg2.errors.UniqueViolation:
+            conn_local = _conn
+            conn_local.rollback() if not conn_local.autocommit else None
+
     # جدول جديد: مواقع البحث المستهدفة اللي يدور عليهم n8n
     c.execute("""CREATE TABLE IF NOT EXISTS search_sites (
         id SERIAL PRIMARY KEY,
@@ -398,6 +413,90 @@ def get_worksheet():
         return worksheet, None
     except Exception as e:
         return None, f"تعذّر فتح الشيت: {e}"
+
+
+# ============================================================
+# 3د) إشعارات المتصفح الحقيقية (Desktop/Browser Notifications)
+# ------------------------------------------------------------
+# الفكرة: نستخدم Notification API الأصلية بالمتصفح (نفس اللي تستخدمها
+# واتساب ويب/تيليجرام ويب) عشان يوصلك إشعار على اللابتوب زي إشعار رسالة،
+# حتى لو الموقع مصغّر أو بتاب ثاني — بشرط يبقى المتصفح فاتح (تاب الموقع
+# ما يكون مقفول كامل).
+#
+# قيود مهمة لازم تعرفها:
+# 1) لازم تفتح الموقع عبر HTTPS (أو localhost وقت التطوير) — المتصفحات
+#    تمنع Notification API على http:// العادي.
+# 2) المستخدم لازم يوافق على الإذن مرة وحدة بس (زر "تفعيل الإشعارات"
+#    بالقائمة الجانبية) — بعدها المتصفح يتذكر الموافقة تلقائياً.
+# 3) الإشعار ما يوصل إلا وقت إعادة تحميل/تحديث الصفحة (Rerun) — لذا
+#    أضفنا تحديث تلقائي خفيف (Auto-refresh) كل 20 ثانية بكل الصفحات
+#    ماعدا صفحة "الأخبار والمساعد الذكي" تحديداً (لأن التحديث التلقائي
+#    فيها يقاطع انتظار رد الذكاء الاصطناعي، نفس المشكلة اللي حلّيناها
+#    قبل بإزالة الأوتوريفرش من تلك الصفحة).
+# ============================================================
+
+def request_browser_notification_permission():
+    """يعرض زر بالقائمة الجانبية لطلب إذن الإشعارات من المتصفح مرة وحدة بس"""
+    st.components.v1.html("""
+        <div style="font-family: 'Segoe UI', sans-serif; direction: rtl;">
+          <button id="notif-permission-btn" style="
+              width: 100%; padding: 8px 12px; border-radius: 10px; border: none;
+              background: linear-gradient(90deg,#6366f1,#8b5cf6); color: white;
+              font-weight: 600; cursor: pointer; font-size: 13px;">
+            🔔 تفعيل إشعارات المتصفح
+          </button>
+          <div id="notif-status" style="color:#e2e8f0; font-size:12px; margin-top:6px; text-align:right;"></div>
+          <script>
+            const btn = document.getElementById("notif-permission-btn");
+            const statusBox = document.getElementById("notif-status");
+
+            function updateStatus() {
+              if (!("Notification" in window)) {
+                statusBox.innerText = "⚠️ المتصفح ما يدعم الإشعارات.";
+                btn.disabled = true;
+                return;
+              }
+              if (Notification.permission === "granted") {
+                statusBox.innerText = "✅ الإشعارات مفعّلة على هذا المتصفح.";
+                btn.innerText = "🔔 الإشعارات مفعّلة";
+                btn.disabled = true;
+              } else if (Notification.permission === "denied") {
+                statusBox.innerText = "🚫 تم رفض الإذن — فعّله يدوياً من إعدادات المتصفح للموقع.";
+              } else {
+                statusBox.innerText = "لم يتم تفعيل الإذن بعد.";
+              }
+            }
+
+            btn.addEventListener("click", function () {
+              Notification.requestPermission().then(function () {
+                updateStatus();
+              });
+            });
+
+            updateStatus();
+          </script>
+        </div>
+    """, height=90)
+
+
+def browser_notify(title: str, body: str):
+    """
+    يطلق إشعار متصفح حقيقي فوري (يظهر على سطح مكتب اللابتوب زي إشعار رسالة)،
+    بشرط يكون المستخدم وافق على الإذن مسبقاً عبر request_browser_notification_permission().
+    لو ما وافق بعد، الإشعار ببساطة ما يظهر بدون أي خطأ يوقف التطبيق.
+    """
+    safe_title = json.dumps(title, ensure_ascii=False)
+    safe_body = json.dumps(body, ensure_ascii=False)
+    st.components.v1.html(f"""
+        <script>
+          if ("Notification" in window && Notification.permission === "granted") {{
+            new Notification({safe_title}, {{
+              body: {safe_body},
+              icon: "https://em-content.zobj.net/source/microsoft-teams/363/newspaper_1f4f0.png"
+            }});
+          }}
+        </script>
+    """, height=0)
 
 
 # ============================================================
@@ -682,6 +781,15 @@ def get_cached_news_count(_conn):
 
 
 @st.cache_data(ttl=5, show_spinner=False)
+def get_cached_latest_news_titles(_conn, limit: int = 5):
+    """يجيب عناوين آخر الأخبار (للاستخدام بنص إشعار المتصفح)، مخزّنة مؤقتاً 5 ثواني"""
+    df = pd.read_sql_query(
+        f"SELECT title FROM news ORDER BY id DESC LIMIT {int(limit)}", _conn
+    )
+    return df["title"].tolist()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
 def get_cached_recent_failures(_conn):
     """
     نفس فكرة get_cached_news_count لكن لصندوق تنبيهات الفشل.
@@ -709,7 +817,8 @@ def get_cached_recent_failures(_conn):
 # ============================================================
 # 4ب) إشعارات فورية على مستوى التطبيق كامل (تظهر بأي صفحة تكون فيها)
 # ------------------------------------------------------------
-# 1) إشعار عند وصول خبر جديد لجدول news.
+# 1) إشعار عند وصول خبر جديد لجدول news (توست داخل الموقع + إشعار متصفح
+#    حقيقي على سطح المكتب، بشرط تفعيل الإذن من القائمة الجانبية).
 # 2) إشعار فوري (توست) عند تسجيل أي عملية فاشلة بجدول automation_log،
 #    بالإضافة لصندوق تنبيه دائم يعرض فقط الإخفاقات اللي ما تم الاطلاع عليها
 #    (سطر واحد لكل رابط — آخر فشل له فقط، بدل تراكم كل المحاولات).
@@ -731,13 +840,22 @@ def get_cached_recent_failures(_conn):
 # لكل رابط" بصفحة مواقع البحث المستهدفة.
 # ============================================================
 
-# --- إشعار: خبر جديد وصل (يظهر ويختفي تلقائياً بعد ثواني) ---
+# --- إشعار: خبر جديد وصل (يظهر ويختفي تلقائياً بعد ثواني + إشعار متصفح) ---
 current_news_count = get_cached_news_count(conn)
 if "last_seen_news_count" not in st.session_state:
     st.session_state.last_seen_news_count = current_news_count
 elif current_news_count > st.session_state.last_seen_news_count:
     new_items = current_news_count - st.session_state.last_seen_news_count
     st.toast(f"🆕 وصل {new_items} خبر جديد!", icon="📰")
+
+    # إشعار المتصفح الحقيقي: نعرض أول 3 عناوين جديدة كأمثلة بمتن الإشعار
+    latest_titles = get_cached_latest_news_titles(conn, limit=min(new_items, 3))
+    if latest_titles:
+        notif_body = "، ".join(t[:60] for t in latest_titles)
+    else:
+        notif_body = "افتح لوحة التحكم لمشاهدة التفاصيل."
+    browser_notify(f"🆕 وصل {new_items} خبر جديد", notif_body)
+
     st.session_state.last_seen_news_count = current_news_count
 
 # --- تحميل الإخفاقات اللي لسا ما تم الاطلاع عليها (سطر واحد لكل رابط) ---
@@ -822,6 +940,22 @@ except ModuleNotFoundError:
         "قوقل شيت",
         "الإعدادات"
     ])
+
+# ---- زر تفعيل إشعارات المتصفح (يظهر دائماً أسفل القائمة الجانبية) ----
+with st.sidebar:
+    st.divider()
+    request_browser_notification_permission()
+
+# ---- تحديث تلقائي خفيف كل 20 ثانية لضمان وصول الإشعار حتى لو الصفحة
+# مصغّرة/بالخلفية، ماعدا صفحة الأخبار والمساعد الذكي (لتفادي مقاطعة
+# انتظار رد الذكاء الاصطناعي أثناء إرسال السؤال — نفس السبب المذكور
+# بأعلى صفحة الأخبار) ----
+if page != "الأخبار والمساعد الذكي":
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=20_000, key="global_notification_autorefresh")
+    except ModuleNotFoundError:
+        st.sidebar.caption("لتفعيل التحديث التلقائي (يضمن وصول الإشعارات وأنت مبتعد عن الصفحة)، نفّذ:\npip install streamlit-autorefresh")
 
 
 # ============================================================
@@ -999,6 +1133,16 @@ elif page == "مواقع البحث المستهدفة":
             if link not in latest_status_by_link:
                 latest_status_by_link[link] = (log_row["status"], log_row["timestamp"])
 
+        # ---- سجل استبدال الروابط عبر الذكاء الاصطناعي (action = 'استبدال رابط') ----
+        # لو n8n يستبدل رابط ما يشتغل برابط جديد صحيح عبر عقدة ذكاء اصطناعي،
+        # ولازم يسجّل العملية بجدول automation_log بهذا الشكل حتى يظهر هنا:
+        #   INSERT INTO automation_log (action, status, details, timestamp)
+        #   VALUES ('استبدال رابط', 'نجاح', '<الرابط القديم> -> <الرابط الجديد>', '<الوقت>')
+        df_link_replacements = pd.read_sql_query(
+            "SELECT details, timestamp FROM automation_log "
+            "WHERE action = 'استبدال رابط' AND status = 'نجاح' ORDER BY id DESC LIMIT 20", conn
+        )
+
         for _, row in df_sites.iterrows():
             c0, c1, c2, c3, c4 = st.columns([1, 3, 2, 2, 1.5])
             c0.checkbox("تحديد", value=False, key=f"sel_site_{row['id']}", label_visibility="collapsed")
@@ -1019,6 +1163,14 @@ elif page == "مواقع البحث المستهدفة":
             if c4.button("🗑️ حذف", key=f"site_del_{row['id']}"):
                 delete_site(row["id"])
                 st.rerun()
+
+        if not df_link_replacements.empty:
+            st.divider()
+            st.subheader("🤖 روابط استبدلها الذكاء الاصطناعي تلقائياً")
+            st.dataframe(
+                df_link_replacements.rename(columns={"details": "التبديل", "timestamp": "التاريخ"}),
+                use_container_width=True, hide_index=True
+            )
 
     # ---- مربع دائم: كل الروابط اللي ما اشتغلت، مع تاريخ كل فشل ----
     st.divider()
